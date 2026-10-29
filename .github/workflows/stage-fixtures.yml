@@ -1,0 +1,106 @@
+# Stages viewer-dependent fixture states in the public repo you control (SPEC §12, and
+# "Staging" in FIXTURES_NEEDED.md). Nothing in this repo runs it: copy it to
+# .github/workflows/stage-fixtures.yml on that repo's default branch, then run it by hand from
+# the Actions tab. It acts as github-actions[bot] with the workflow's own token, so it needs no
+# other account and no secrets.
+name: Stage fixture state
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        options:
+          - open-pr
+          - approve
+          - request-changes
+          - comment
+          - dismiss
+          - request-review
+      pr:
+        description: PR number (every action except open-pr)
+        required: false
+      title:
+        description: Title for open-pr
+        required: false
+        default: Staged PR
+      reviewer:
+        description: For request-review, a user's login
+        required: false
+      team:
+        description: For request-review, a team's slug in this org
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Inputs reach the script through the environment, never interpolated into it, so they
+      # can't inject shell code.
+      ACTION: ${{ inputs.action }}
+      PR: ${{ inputs.pr }}
+      TITLE: ${{ inputs.title }}
+      REVIEWER: ${{ inputs.reviewer }}
+      TEAM: ${{ inputs.team }}
+    steps:
+      - name: Stage
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" != open-pr ] && ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "pr must be a PR number" >&2
+            exit 1
+          fi
+          case "$ACTION" in
+            open-pr)
+              # Commits through the contents API, so the branch and commit are the bot's too.
+              base=$(gh api "repos/$GH_REPO" --jq .default_branch)
+              sha=$(gh api "repos/$GH_REPO/git/ref/heads/$base" --jq .object.sha)
+              branch="stage/$GITHUB_RUN_ID"
+              gh api "repos/$GH_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$sha" >/dev/null
+              content=$(printf 'Staged by run %s.\n' "$GITHUB_RUN_ID" | base64 -w0)
+              gh api -X PUT "repos/$GH_REPO/contents/staged/$GITHUB_RUN_ID.md" \
+                -f message="Stage a PR" -f content="$content" -f branch="$branch" >/dev/null
+              gh pr create --base "$base" --head "$branch" --title "$TITLE" \
+                --body "Staged for Review Portal's test fixtures."
+              ;;
+            approve)
+              gh pr review "$PR" --approve --body "Staged approval."
+              ;;
+            request-changes)
+              gh pr review "$PR" --request-changes --body "Staged change request."
+              ;;
+            comment)
+              gh pr review "$PR" --comment --body "Staged comment."
+              ;;
+            dismiss)
+              # The bot's latest opinionated review on the PR.
+              id=$(gh api --paginate "repos/$GH_REPO/pulls/$PR/reviews" --jq '.[]
+                | select(.user.login == "github-actions[bot]")
+                | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED") | .id' | tail -n 1)
+              if [ -z "$id" ]; then
+                echo "PR $PR has no approval or change request from github-actions[bot]" >&2
+                exit 1
+              fi
+              gh api -X PUT "repos/$GH_REPO/pulls/$PR/reviews/$id/dismissals" \
+                -f message="Staged dismissal." -f event=DISMISS >/dev/null
+              ;;
+            request-review)
+              if [ -n "$TEAM" ]; then
+                gh api "repos/$GH_REPO/pulls/$PR/requested_reviewers" \
+                  -f "team_reviewers[]=$TEAM" >/dev/null
+              elif [ -n "$REVIEWER" ]; then
+                gh api "repos/$GH_REPO/pulls/$PR/requested_reviewers" \
+                  -f "reviewers[]=$REVIEWER" >/dev/null
+              else
+                echo "request-review needs a reviewer or a team" >&2
+                exit 1
+              fi
+              ;;
+          esac
